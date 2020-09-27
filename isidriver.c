@@ -19,6 +19,8 @@
 MODULE_LICENSE("GPL");
 
 
+#define DMA_MAPPING (1 << 7)
+
 /* Innovative Magic Number */
 #define II_IOCTL_MAGIC_NUM  'm'
 
@@ -526,9 +528,9 @@ static int isi_allocate_dma_memory_ioctl(struct file *pfile, void __user *uaddr)
 
     pchannel_p->dmas[idx].size   = minfo.size;
     pchannel_p->dmas[idx].kaddr  = minfo.kaddr = dma_alloc_coherent(pchannel_p->dma_device_p,
-                                                                 pchannel_p->dmas[idx].size,
-                                                                 &pchannel_p->dmas[idx].handle,
-                                                                 GFP_KERNEL);
+                                                                    pchannel_p->dmas[idx].size,
+                                                                    &pchannel_p->dmas[idx].handle,
+                                                                    GFP_KERNEL);
 
     if (pchannel_p->dmas[idx].kaddr == NULL) {
         printk(KERN_INFO "ii : Dma memory allocation failed!\n");
@@ -641,7 +643,7 @@ static long ISI_c_ioctl(struct file *pfile, unsigned int cmd , unsigned long arg
     return 0;
 }
 
-static int ISI_c_mmap(struct file *file_p, struct vm_area_struct *vma)
+static int ISI_c_mmap(struct file *pfile, struct vm_area_struct *vma)
 {
 
     //    struct ISI_MCDMA_channel *pchannel_p = (struct ISI_MCDMA_channel *)file_p->private_data;
@@ -649,6 +651,25 @@ static int ISI_c_mmap(struct file *file_p, struct vm_area_struct *vma)
     //    return dma_mmap_coherent(pchannel_p->dma_device_p, vma,
     //                             pchannel_p->interface_p, pchannel_p->interface_phys_addr,
     //                             vma->vm_end - vma->vm_start);
+
+    struct ISI_MCDMA_channel *pchannel_p = (struct ISI_MCDMA_channel *)pfile->private_data;
+
+    unsigned idx = (vma->vm_pgoff & ~DMA_MAPPING) & 0xff; /* We are using the offset for index! */
+
+    printk(KERN_ALERT "MMAP DMA #%u length %lu", idx, vma->vm_end - vma->vm_start);
+
+    if ((vma->vm_end - vma->vm_start) > pchannel_p->dmas[idx].size) {
+        return -EINVAL;
+    }
+
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+    if (remap_pfn_range(vma, vma->vm_start,pchannel_p->dmas[idx].paddr >> PAGE_SHIFT,
+                        vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
+        return -EAGAIN;
+    }
+
+    return 0;
 
     printk(KERN_ALERT "Inside the %s function\n", __FUNCTION__);
 
