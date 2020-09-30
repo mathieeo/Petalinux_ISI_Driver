@@ -53,7 +53,7 @@ typedef struct
 {
     unsigned int *  uaddr;
     unsigned int *  kaddr;
-    unsigned int    paddr;
+    unsigned long   paddr;
     unsigned int    size;
     unsigned int    index;
     unsigned        mapped;
@@ -122,20 +122,25 @@ static int MCDMA_slave_func(void *data)
     int ret;
     int bd_cnt = XILINX_BD_CNT;
     int i;
+    u8 align = 0;
+    struct dma_device *dma_dev;
+    struct dma_async_tx_descriptor *desc = NULL;
+    struct completion _cmp;
+    unsigned long _tmo = msecs_to_jiffies(300000); /* RX takes longer */
+
+    //temp
+    int idx;
+    unsigned int *buf;
 
     thread_name = current->comm;
     ret = -ENOMEM;
     /* Ensure that all previous reads are complete */
     smp_rmb();
     chan = thread->dmachan;
+    dma_dev = chan->device;
 
     set_user_nice(current, 10);
     flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
-    struct dma_device *dma_dev = chan->device;
-    struct dma_async_tx_descriptor *desc = NULL;
-    struct completion _cmp;
-    unsigned long _tmo = msecs_to_jiffies(300000); /* RX takes longer */
-    u8 align = 0;
 
     if (dma_dev->copy_align > align)
         align = dma_dev->copy_align;
@@ -191,8 +196,6 @@ static int MCDMA_slave_func(void *data)
 
 
     //---------------------------------------
-    int idx;
-    unsigned int *buf;
     //temp
     for (i=0;i<bd_cnt;i++) {
         buf = _pchannel_p->dmas[i].kaddr;
@@ -352,7 +355,7 @@ static int isi_allocate_dma_memory_ioctl(struct file *pfile, void __user *uaddr)
 
     minfo.index = idx; /* Pass the index to user so he can use it to map */
 
-    printk(KERN_INFO "[ISI] : Alloc size %d at index %d kaddr 0x%p phaddr 0x%09x \n", minfo.size,
+    printk(KERN_INFO "[ISI] : Alloc size %d at index %d kaddr 0x%p phaddr 0x%lx \n", minfo.size,
            idx, pchannel_p->dmas[idx].kaddr, pchannel_p->dmas[idx].paddr);
 
     if (copy_to_user(uaddr, &minfo, sizeof(dma_memory_handle_t))) {
@@ -361,7 +364,6 @@ static int isi_allocate_dma_memory_ioctl(struct file *pfile, void __user *uaddr)
     }
 
     return 0;
-
 }
 
 /**
@@ -402,22 +404,16 @@ static int isi_free_dma_memory_ioctl(struct file *pfile, void __user *uaddr)
 static int ISI_c_open (struct inode *pinode, struct file *pfile)
 {
     pfile->private_data = container_of(pinode->i_cdev, struct ISI_MCDMA_channel, cdev);
-    //    struct ISI_MCDMA_channel *pchannel_p = (struct ISI_MCDMA_channel *)pfile->private_data;
-
     return 0;
 }
 
 static ssize_t ISI_c_read(struct file *pfile, char __user *buffer, size_t length, loff_t *offset)
 {
-
-
     return 0;
 }
 
 static ssize_t ISI_c_write (struct file *pfile, const char __user *buffer, size_t length, loff_t *offset)
 {
-
-
     return length;
 }
 
@@ -461,7 +457,7 @@ static int ISI_c_mmap(struct file *pfile, struct vm_area_struct *vma)
 {
     struct ISI_MCDMA_channel *pchannel_p = (struct ISI_MCDMA_channel *)pfile->private_data;
 
-    unsigned idx = (vma->vm_pgoff & ~DMA_MAPPING) & 0xff; /* We are using the offset for index! */
+    unsigned int idx = (vma->vm_pgoff & ~DMA_MAPPING) & 0xff; /* We are using the offset for index! */
     printk(KERN_ALERT "MMAP DMA #%u length %lu \n", idx, vma->vm_end - vma->vm_start);
 
     if ((vma->vm_end - vma->vm_start) > pchannel_p->dmas[idx].size) {
@@ -469,15 +465,11 @@ static int ISI_c_mmap(struct file *pfile, struct vm_area_struct *vma)
         return -EINVAL;
     }
 
+    vma->vm_pgoff = 0; //clear
+    vma->vm_flags    |= VM_IO;
     vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
-    if (remap_pfn_range(vma, vma->vm_start,pchannel_p->dmas[idx].paddr >> PAGE_SHIFT,
-                        vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
-        printk(KERN_ALERT "MMAP could not map the address area. \n");
-        return -EAGAIN;
-    }
-
-    return 0;
+    return dma_mmap_coherent(pchannel_p->dma_device_p, vma, pchannel_p->dmas[idx].kaddr, pchannel_p->dmas[idx].handle, pchannel_p->dmas[idx].size);
 }
 
 static int ISI_c_close(struct inode *pinode, struct file *pfile)
@@ -625,8 +617,9 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
     for(i=0;i<NUMBER_OF_CHANNELS_PER_DIR;i++){
         char tx_device_name[32] = "mcdma_tx_";
         char dummy[32] = "";
+        char * name;
         sprintf(dummy, "%d", i);
-        char * name = strcat(tx_device_name, dummy);
+        name = strcat(tx_device_name, dummy);
         pr_warn("[Creating Tx Channel [%d] With Name [%s]", i, name);
         rc = create_channel(pdev, &channels[i], name, DMA_MEM_TO_DEV);
         if (rc)
@@ -637,8 +630,9 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
     for(i=0;i<NUMBER_OF_CHANNELS_PER_DIR;i++){
         char rx_device_name[32] = "mcdma_rx_";
         char dummy[32] = "";
+        char * name;
         sprintf(dummy, "%d", i);
-        char * name = strcat(rx_device_name, dummy);
+        name = strcat(rx_device_name, dummy);
         pr_warn("[Creating Rx Channel [%d] With Name [%s]", i, name);
         rc = create_channel(pdev, &channels[i], name, DMA_DEV_TO_MEM);
         if (rc)
@@ -653,8 +647,6 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
  */
 static int ISI_p_MCDMA_remove(struct platform_device *pdev)
 {
-
-
     return 0;
 }
 
@@ -685,7 +677,6 @@ static int __init ISI_MCDMA_init(void)
 
 static void __exit ISI_MCDMA_exit(void)
 {
-
     platform_driver_unregister(&ISI_MCDMA_driver);
 }
 
