@@ -15,6 +15,8 @@
 #include <linux/wait.h>
 #include <linux/dma/xilinx_dma.h>
 #include <linux/random.h>
+#include <linux/interrupt.h>
+#include <linux/of_irq.h>
 
 MODULE_LICENSE("GPL");
 
@@ -49,6 +51,9 @@ static LIST_HEAD(MCDMA_channels);
 #define MAX_DMA_HANDLES XILINX_BD_CNT
 
 
+//temp
+int irq;
+
 typedef struct
 {
     unsigned int *  uaddr;
@@ -81,7 +86,8 @@ struct ISI_MCDMA_channel {
 
 /* Allocate the channels for this example statically rather than dynamically for simplicity.
  */
-static struct ISI_MCDMA_channel channels[CHANNEL_COUNT];
+static struct ISI_MCDMA_channel Rx_Channels[NUMBER_OF_CHANNELS_PER_DIR];
+static struct ISI_MCDMA_channel Tx_Channels[NUMBER_OF_CHANNELS_PER_DIR];
 
 
 struct MCDMA_slave_thread {
@@ -302,7 +308,7 @@ static int MCDMA_add_slave_channels(struct ISI_MCDMA_channel *pchannel_p)
 
 /**
  * find_dma_handle - Helper that finds the context index from the given address
- * @inode:		Inode pointer
+ * @inode:		Inode pointernode
  * @filp:		File pointer
  * returns:		-1 (error), or [0..MAX_DMA_HANDLES-1]
  */
@@ -604,6 +610,20 @@ free_channel:
 
 }
 
+/**
+ * xilinx_mcdma_irq_handler - MCDMA Interrupt handler
+ * @irq: IRQ number
+ * @data: Pointer to the Xilinx MCDMA channel structure
+ *
+ * Return: IRQ_HANDLED/IRQ_NONE
+ */
+static irqreturn_t irq_handler(int irq, void *data)
+{
+
+    pr_warn("______________________INTERRUPT[%d]______________________", irq);
+
+    return IRQ_HANDLED;
+}
 
 /* Prob the mcdma platform driver
  */
@@ -621,7 +641,7 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
         sprintf(dummy, "%d", i);
         name = strcat(tx_device_name, dummy);
         pr_warn("[Creating Tx Channel [%d] With Name [%s]", i, name);
-        rc = create_channel(pdev, &channels[i], name, DMA_MEM_TO_DEV);
+        rc = create_channel(pdev, &Tx_Channels[i], name, DMA_MEM_TO_DEV);
         if (rc)
             return rc;
     }
@@ -634,9 +654,34 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
         sprintf(dummy, "%d", i);
         name = strcat(rx_device_name, dummy);
         pr_warn("[Creating Rx Channel [%d] With Name [%s]", i, name);
-        rc = create_channel(pdev, &channels[i], name, DMA_DEV_TO_MEM);
+        rc = create_channel(pdev, &Rx_Channels[i], name, DMA_DEV_TO_MEM);
         if (rc)
             return rc;
+    }
+
+    /* Request the interrupt */
+
+    /* Initialize the channels */
+    int counter = 0;
+    struct device_node *child;
+    for_each_child_of_node(pdev->dev.of_node, child) {
+
+        printk(KERN_INFO "____counter %d \n", counter);
+
+        if(counter==1){
+            printk(KERN_INFO "____counter %d    irq %d\n", counter, irq);
+            irq = irq_of_parse_and_map(child, 0);
+
+            printk(KERN_INFO "____counter %d    irq %d\n", counter, irq);
+
+            rc = request_irq(irq, irq_handler,
+                             IRQF_SHARED, "xilinx-dma-controller-0", &Rx_Channels[0]/*chan*/);
+            if (rc) {
+                printk(KERN_INFO "unable to request IRQ %d\n", irq);
+                return rc;
+            }
+        }
+        counter +=1;
     }
 
     printk(KERN_INFO "ISI MCDMA module initialized\n");
@@ -647,6 +692,9 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
  */
 static int ISI_p_MCDMA_remove(struct platform_device *pdev)
 {
+    if (irq > 0)
+        free_irq(irq, &Rx_Channels[0]);
+
     return 0;
 }
 

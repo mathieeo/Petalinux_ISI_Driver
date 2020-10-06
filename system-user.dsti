@@ -1,0 +1,61 @@
+/include/ "system-conf.dtsi"
+/ {
+axidmatest_1: axidmatest@1 {
+        compatible ="xlnx,axi-dma-test-1.00.a";
+        dmas = <&axi_mcdma 15
+                &axi_mcdma 31>;
+        dma-names = "axidma0", "axidma1";
+};
+isidriver_1: isidriver@1 {
+	#address-cells = <2>;
+	#size-cells = <2>;
+        compatible ="xlnx,isi_mcdma";
+        dmas = <&axi_mcdma 0 &axi_mcdma 1 &axi_mcdma 2 &axi_mcdma 3 &axi_mcdma 4 &axi_mcdma 5 &axi_mcdma 6 &axi_mcdma 7 &axi_mcdma 8 &axi_mcdma 9 &axi_mcdma 10 &axi_mcdma 11 &axi_mcdma 12 &axi_mcdma 13 &axi_mcdma 14 &axi_mcdma 15
+                &axi_mcdma 16 &axi_mcdma 17 &axi_mcdma 18 &axi_mcdma 19 &axi_mcdma 20 &axi_mcdma 21 &axi_mcdma 22 &axi_mcdma 23 &axi_mcdma 24 &axi_mcdma 25 &axi_mcdma 26 &axi_mcdma 27 &axi_mcdma 28 &axi_mcdma 29 &axi_mcdma 30 &axi_mcdma 31>;
+        dma-names = "mcdma_tx_0", "mcdma_tx_1", "mcdma_tx_2", "mcdma_tx_3", "mcdma_tx_4", "mcdma_tx_5",
+    "mcdma_tx_6", "mcdma_tx_7", "mcdma_tx_8", "mcdma_tx_9", "mcdma_tx_10", "mcdma_tx_11", "mcdma_tx_12", "mcdma_tx_13", "mcdma_tx_14", "mcdma_tx_15",
+"mcdma_rx_0", "mcdma_rx_1", "mcdma_rx_2", "mcdma_rx_3", "mcdma_rx_4", "mcdma_rx_5", "mcdma_rx_6", "mcdma_rx_7", "mcdma_rx_8", "mcdma_rx_9", "mcdma_rx_10", "mcdma_rx_11", "mcdma_rx_12", "mcdma_rx_13", "mcdma_rx_14", "mcdma_rx_15";
+
+	interrupt-names = "mm2s_ch1_introut", "mm2s_ch2_introut", "mm2s_ch3_introut", "mm2s_ch4_introut", "mm2s_ch5_introut", "mm2s_ch6_introut", "mm2s_ch7_introut", "mm2s_ch8_introut", "mm2s_ch9_introut", "mm2s_ch10_introut", "mm2s_ch11_introut", "mm2s_ch12_introut", "mm2s_ch13_introut", "mm2s_ch14_introut", "mm2s_ch15_introut", "mm2s_ch16_introut", "s2mm_ch1_introut", "s2mm_ch2_introut", "s2mm_ch3_introut", "s2mm_ch4_introut", "s2mm_ch5_introut", "s2mm_ch6_introut", "s2mm_ch7_introut", "s2mm_ch8_introut", "s2mm_ch9_introut", "s2mm_ch10_introut", "s2mm_ch11_introut", "s2mm_ch12_introut", "s2mm_ch13_introut", "s2mm_ch14_introut", "s2mm_ch15_introut", "s2mm_ch16_introut";
+	interrupt-parent = <&gic>;
+	interrupts = <0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4>;
+
+dma-ch@0 {
+				compatible = "xlnx,axi-dma-mm2s-channel";
+				dma-channels = <0x10>;
+				interrupt-parent = <&gic>;
+				interrupts = <0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4 0 89 4>;
+				xlnx,datawidth = <0x80>;
+				xlnx,device-id = <0x0>;
+			};
+dma-ch@1 {
+				compatible = "xlnx,axi-dma-s2mm-channel";
+				dma-channels = <0x10>;
+				interrupt-parent = <&gic>;
+				interrupts = <0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4 0 90 4>;
+				xlnx,datawidth = <0x80>;
+				xlnx,device-id = <0x0>;
+			};
+};
+};
+
+&axi_mcdma {
+	#dma-cells = <1>;
+};
+
+
+&gem1 {
+	phy-mode = "sgmii";
+	phy-handle = <&phy0>;
+	status = "okay";
+	is-internal-pcspma;
+	xlnx,ptp-enet-clock = <0x0>;
+	phy0: phy@0 {
+    	    	compatible = "ethernet-phy-ieee802.3-c22"; 
+    		device_type = "ethernet-phy";
+                ti,rx-internal-delay = <0x8>;
+                ti,tx-internal-delay = <0xa>;
+		ti,fifo-depth = <0x1>;
+   		reg = <0>;
+	};
+};
