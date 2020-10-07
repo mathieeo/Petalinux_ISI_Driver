@@ -29,9 +29,8 @@ MODULE_LICENSE("GPL");
 #define  IOCTL_ALLOC_DMA_MEMORY    _IOWR(II_IOCTL_MAGIC_NUM, 10,dma_memory_handle_t*)
 #define  IOCTL_FREE_DMA_MEMORY     _IOR (II_IOCTL_MAGIC_NUM, 11,dma_memory_handle_t*)
 #define  IOCTL_START_DMA           _IO  (II_IOCTL_MAGIC_NUM, 12)
-#define  IOCTL_PRINT_RX_BUFF       _IO  (II_IOCTL_MAGIC_NUM, 13)
 
-static DECLARE_WAIT_QUEUE_HEAD(thread_wait);
+//static DECLARE_WAIT_QUEUE_HEAD(thread_wait);
 
 static unsigned int test_buf_size = 8192;
 
@@ -49,10 +48,6 @@ static LIST_HEAD(MCDMA_channels);
 
 #define XILINX_BD_CNT	11
 #define MAX_DMA_HANDLES XILINX_BD_CNT
-
-
-//temp
-int irq;
 
 typedef struct
 {
@@ -75,35 +70,30 @@ struct ISI_MCDMA_channel {
     dev_t dev_node;
     struct cdev cdev;
     struct class *class_p;
-
-    struct dma_chan *channel_p;				/* dma support */
+    struct dma_chan *channel_p;
+    struct dma_async_tx_descriptor *desc;			/* dma support */
     struct completion cmp;
-    u32 direction;					/* DMA_MEM_TO_DEV or DMA_DEV_TO_MEM */
-    struct MCDMA_chan *test_chan;
+    dma_cookie_t _cookie;
+    enum dma_ctrl_flags flags;
     struct scatterlist sglist[XILINX_BD_CNT];
     dma_memory_handle_t dmas[XILINX_BD_CNT];
+    int _IRQ;
+    int _ID;
+    u32 direction;					/* DMA_MEM_TO_DEV or DMA_DEV_TO_MEM */
 };
 
-/* Allocate the channels for this example statically rather than dynamically for simplicity.
+struct ISI_Device_Context {
+    /* Allocate the channels for this example statically rather than dynamically for simplicity.
  */
-static struct ISI_MCDMA_channel Rx_Channels[NUMBER_OF_CHANNELS_PER_DIR];
-static struct ISI_MCDMA_channel Tx_Channels[NUMBER_OF_CHANNELS_PER_DIR];
+    struct ISI_MCDMA_channel Rx_Channels[NUMBER_OF_CHANNELS_PER_DIR];
+    struct ISI_MCDMA_channel Tx_Channels[NUMBER_OF_CHANNELS_PER_DIR];
 
-
-struct MCDMA_slave_thread {
-    struct list_head node;
-    struct task_struct *task;
-    struct dma_chan *dmachan;
-    struct ISI_MCDMA_channel *_pchannel_p;
-    enum dma_transaction_type type;
-    bool done;
 };
+struct ISI_Device_Context *isi_device_context;
 
-struct MCDMA_chan {
-    struct list_head node;
-    struct dma_chan *chan;
-    struct list_head threads;
-};
+
+
+
 
 
 static void MCDMA_slave_callback(void *completion)
@@ -113,40 +103,23 @@ static void MCDMA_slave_callback(void *completion)
     pr_warn("DMA Callback....");
 }
 
-/* Function for slave transfers
- * Each thread requires 2 channels, one for transmit, and one for receive
- */
-static int MCDMA_slave_func(void *data)
+static int MCDMA_Start_Channel_Transfer(struct ISI_MCDMA_channel *pchannel_p)
 {
-    struct MCDMA_slave_thread	*thread = data;
-    struct ISI_MCDMA_channel *_pchannel_p = thread->_pchannel_p;
     struct dma_chan *chan;
-    const char *thread_name;
-    dma_cookie_t _cookie;
-    enum dma_status status;
-    enum dma_ctrl_flags flags;
     int ret;
     int bd_cnt = XILINX_BD_CNT;
     int i;
     u8 align = 0;
     struct dma_device *dma_dev;
-    struct dma_async_tx_descriptor *desc = NULL;
-    struct completion _cmp;
-    unsigned long _tmo = msecs_to_jiffies(300000); /* RX takes longer */
 
-    //temp
-    int idx;
-    unsigned int *buf;
-
-    thread_name = current->comm;
     ret = -ENOMEM;
     /* Ensure that all previous reads are complete */
     smp_rmb();
-    chan = thread->dmachan;
+    chan = pchannel_p->channel_p;
     dma_dev = chan->device;
 
     set_user_nice(current, 10);
-    flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
+    pchannel_p->flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
 
     if (dma_dev->copy_align > align)
         align = dma_dev->copy_align;
@@ -157,151 +130,35 @@ static int MCDMA_slave_func(void *data)
         return ERROR;
     }
 
-    sg_init_table(_pchannel_p->sglist, bd_cnt);
+    sg_init_table(pchannel_p->sglist, bd_cnt);
 
     for (i = 0; i < bd_cnt; i++) {
-        sg_dma_address(&_pchannel_p->sglist[i]) =  _pchannel_p->dmas[i].handle;
-        sg_dma_len(&_pchannel_p->sglist[i]) = test_buf_size;
+        sg_dma_address(&pchannel_p->sglist[i]) =  pchannel_p->dmas[i].handle;
+        sg_dma_len(&pchannel_p->sglist[i]) = test_buf_size;
     }
 
-    desc = dma_dev->device_prep_slave_sg(chan, _pchannel_p->sglist, bd_cnt, _pchannel_p->direction, flags, NULL);
+    pchannel_p->desc = dma_dev->device_prep_slave_sg(chan, pchannel_p->sglist, bd_cnt, pchannel_p->direction, pchannel_p->flags, NULL);
 
-    if (!desc) {
+    if (!pchannel_p->desc) {
         for (i = 0; i < bd_cnt; i++)
-            pr_warn("%s: prep error with _off=0x%x ",
-                    thread_name, test_buf_size);
+            pr_warn("[ISI]: prep error with _off=0x%x ",
+                     test_buf_size);
         msleep(100);
     }
-    init_completion(&_cmp);
-    desc->callback = MCDMA_slave_callback;
-    desc->callback_param = &_cmp;
-    _cookie = desc->tx_submit(desc);
+    init_completion(&pchannel_p->cmp);
+    pchannel_p->desc->callback = MCDMA_slave_callback;
+    pchannel_p->desc->callback_param = &pchannel_p->cmp;
+    pchannel_p->_cookie = pchannel_p->desc->tx_submit(pchannel_p->desc);
 
-    if (dma_submit_error(_cookie)) {
-        pr_warn("%s: submit error %d with _off=0x%x ",
-                thread_name, _cookie,  test_buf_size);
+    if (dma_submit_error(pchannel_p->_cookie)) {
+        pr_warn("[ISI]: submit error %d with _off=0x%x ",
+                pchannel_p->_cookie,  test_buf_size);
         msleep(100);
     }
     dma_async_issue_pending(chan);
 
-    _tmo = wait_for_completion_timeout(&_cmp, _tmo);
-
-    status = dma_async_is_tx_complete(chan, _cookie, NULL, NULL);
-
-
-    if (_tmo == 0) {
-        pr_warn("%s: test timed out\n",
-                thread_name);
-    } else if (status != DMA_COMPLETE) {
-        pr_warn("%s: got completion callback, ",
-                thread_name);
-        pr_warn("but status is \'%s\'\n",
-                status == DMA_ERROR ? "error" :
-                                      "in progress");
-    }
-
-
-    //---------------------------------------
-    //temp
-    for (i=0;i<bd_cnt;i++) {
-        buf = _pchannel_p->dmas[i].kaddr;
-        pr_warn("__________________New Buf____________________ \n");
-        for(idx=0;idx<20;idx++){
-            pr_warn("buf[%d]: [0x%x] ", idx, buf[idx]);
-        }
-    }
-    //---------------------------------------
-
-    ret = 0;
-    thread->done = true;
-    wake_up(&thread_wait);
-
-    return ret;
-}
-
-
-static int MCDMA_add_slave_threads(struct ISI_MCDMA_channel *pchannel_p)
-{
-    struct MCDMA_slave_thread *thread;
-
-    struct dma_chan *chan = pchannel_p->channel_p;
-    int ret;
-
-    thread = kzalloc(sizeof(struct MCDMA_slave_thread), GFP_KERNEL);
-    if (!thread) {
-        pr_warn("[ISI] : No memory for slave thread %s\n",
-                dma_chan_name(chan));
-    }
-    //fixme    if(pchannel_p->direction == DMA_MEM_TO_DEV)
-    //        thread->tx_chan = chan;
-    //    else
-
-    thread->dmachan = chan;
-    thread->type = (enum dma_transaction_type)DMA_SLAVE;
-    thread->_pchannel_p = pchannel_p;
-
-    /* Ensure that all previous writes are complete */
-    smp_wmb();
-    thread->task = kthread_run(MCDMA_slave_func, thread, "%s",
-                               dma_chan_name(chan));
-
-    ret = PTR_ERR(thread->task);
-    if (IS_ERR(thread->task)) {
-        pr_warn("[ISI} : Failed to run thread %s\n",
-                dma_chan_name(chan));
-        kfree(thread);
-        return ret;
-    }
-
-    return 1;
-}
-
-static bool is_threaded_test_run(struct MCDMA_chan *dtc)
-{
-
-    struct MCDMA_slave_thread *thread;
-    int ret = false;
-
-    list_for_each_entry(thread, &dtc->threads, node) {
-        if (!thread->done)
-            ret = true;
-    }
-    return ret;
-}
-static int Print_Rx_Buff(struct ISI_MCDMA_channel *pchannel_p)
-{
-    int i,j;
-    for (i = 0; i < XILINX_BD_CNT; i++){
-        unsigned int *buf = pchannel_p->dmas[i].kaddr;
-        pr_warn("_______New Buff (Kernel)________\n");
-        for(j=0;j<20;j++){
-            pr_warn("Buf[%d] 0x%x ", j, buf[j]);
-        }
-    }
-    return 1;
-}
-
-static int MCDMA_add_slave_channels(struct ISI_MCDMA_channel *pchannel_p)
-{
-    unsigned int thread_count = 0;
-
-    pchannel_p->test_chan = kmalloc(sizeof(struct MCDMA_chan), GFP_KERNEL);
-
-    if (!pchannel_p->test_chan) {
-        pr_warn("[ISI] : No memory for tx %s\n",
-                dma_chan_name(pchannel_p->channel_p));
-        return -ENOMEM;
-    }
-
-    pchannel_p->test_chan->chan = pchannel_p->channel_p;
-    INIT_LIST_HEAD(&pchannel_p->test_chan->threads);
-
-    MCDMA_add_slave_threads(pchannel_p);
-    thread_count += 1;
-    pr_info("[ISI] : Started %u threads using %s \n",
-            thread_count, dma_chan_name(pchannel_p->channel_p));
-    list_add_tail(&pchannel_p->test_chan->node, &MCDMA_channels);
-    wait_event(thread_wait, !is_threaded_test_run(pchannel_p->test_chan));
+    pr_warn("[ISI]: DMA issued for channel[%d] ",
+            pchannel_p->_ID);
 
     return 0;
 }
@@ -440,15 +297,11 @@ static long ISI_c_ioctl(struct file *pfile, unsigned int cmd , unsigned long arg
     }
     case IOCTL_START_DMA: {
 
-        err = MCDMA_add_slave_channels(pchannel_p);
+        err = MCDMA_Start_Channel_Transfer(pchannel_p);
         if (err) {
-            pr_err("ISI_MCDMA: Unable to add channels\n");
+            pr_err("ISI_MCDMA: Unable to start channel\n");
             return err;
         }
-        return 1;
-    }
-    case IOCTL_PRINT_RX_BUFF: {
-        Print_Rx_Buff(pchannel_p);
         return 1;
     }
     default: {
@@ -501,6 +354,7 @@ struct file_operations ISI_c_file_operations = {
     .release        = ISI_c_close,
 
 };
+
 
 /* Initialize the driver to be a character device such that is responds to
  * file operations.
@@ -575,7 +429,7 @@ init_error1:
 /* Create a DMA channel by getting a DMA channel from the DMA Engine and then setting
  * up the channel as a character device to allow user space control.
  */
-static int create_channel(struct platform_device *pdev, struct ISI_MCDMA_channel *pchannel_p, char *name, u32 direction)
+static int create_channel(struct platform_device *pdev, struct ISI_MCDMA_channel *pchannel_p, int channel_id, char *name, u32 direction)
 {
     int rc;
 
@@ -593,6 +447,7 @@ static int create_channel(struct platform_device *pdev, struct ISI_MCDMA_channel
     }
 
     pchannel_p->dma_device_p = &pdev->dev;
+    pchannel_p->_ID = channel_id;
 
     /* Initialize the character device for the dma proxy channel
          */
@@ -619,21 +474,51 @@ free_channel:
  */
 static irqreturn_t irq_handler(int irq, void *data)
 {
+    struct ISI_MCDMA_channel *channel = (struct ISI_MCDMA_channel *)data;
+    enum dma_status status;
 
     pr_warn("______________________INTERRUPT[%d]______________________", irq);
+    printk(KERN_INFO "irq[%d] with channel[%d]\n", channel->_IRQ, channel->_ID);
+
+    status = dma_async_is_tx_complete(channel->channel_p, channel->_cookie, NULL, NULL);
+
+    if (status != DMA_COMPLETE) {
+        pr_warn("______DMA NOT COMPLETE_____");
+    }
+    else
+        pr_warn("______DMA COMPLETED_____");
 
     return IRQ_HANDLED;
+}
+
+/*
+ */
+static int Init_ISI_IRQ(struct device_node *child, struct ISI_MCDMA_channel *channel, const char *  irq_name)
+{
+    int rc;
+
+    channel->_IRQ = irq_of_parse_and_map(child, 0);
+
+    printk(KERN_INFO "irq[%d] init with channel[%d]\n", channel->_IRQ, channel->_ID);
+
+    rc = request_irq(channel->_IRQ, irq_handler,
+                     IRQF_SHARED, irq_name, channel);
+    if (rc) {
+        printk(KERN_INFO "unable to request IRQ %d\n", channel->_IRQ);
+        return rc;
+    }
+    return rc;
 }
 
 /* Prob the mcdma platform driver
  */
 static int ISI_p_MCDMA_probe(struct platform_device *pdev)
 {
-    int rc;
+    struct device_node *child;
+    int rc,i;
 
-    /* Create the transmit and receive channels.
-             */
-    int i;
+    isi_device_context = kzalloc(sizeof(struct ISI_Device_Context), GFP_KERNEL);
+
     for(i=0;i<NUMBER_OF_CHANNELS_PER_DIR;i++){
         char tx_device_name[32] = "mcdma_tx_";
         char dummy[32] = "";
@@ -641,7 +526,7 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
         sprintf(dummy, "%d", i);
         name = strcat(tx_device_name, dummy);
         pr_warn("[Creating Tx Channel [%d] With Name [%s]", i, name);
-        rc = create_channel(pdev, &Tx_Channels[i], name, DMA_MEM_TO_DEV);
+        rc = create_channel(pdev, &isi_device_context->Tx_Channels[i], i, name, DMA_MEM_TO_DEV);
         if (rc)
             return rc;
     }
@@ -654,46 +539,43 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
         sprintf(dummy, "%d", i);
         name = strcat(rx_device_name, dummy);
         pr_warn("[Creating Rx Channel [%d] With Name [%s]", i, name);
-        rc = create_channel(pdev, &Rx_Channels[i], name, DMA_DEV_TO_MEM);
+        rc = create_channel(pdev, &isi_device_context->Rx_Channels[i], i, name, DMA_DEV_TO_MEM);
         if (rc)
             return rc;
     }
 
-    /* Request the interrupt */
-
     /* Initialize the channels */
-    int counter = 0;
-    struct device_node *child;
     for_each_child_of_node(pdev->dev.of_node, child) {
-
-        printk(KERN_INFO "____counter %d \n", counter);
-
-        if(counter==1){
-            printk(KERN_INFO "____counter %d    irq %d\n", counter, irq);
-            irq = irq_of_parse_and_map(child, 0);
-
-            printk(KERN_INFO "____counter %d    irq %d\n", counter, irq);
-
-            rc = request_irq(irq, irq_handler,
-                             IRQF_SHARED, "xilinx-dma-controller-0", &Rx_Channels[0]/*chan*/);
-            if (rc) {
-                printk(KERN_INFO "unable to request IRQ %d\n", irq);
+        if(of_device_is_compatible(child, "xlnx,axi-dma-mm2s-channel")){
+            rc = Init_ISI_IRQ(child, &isi_device_context->Tx_Channels[0], "ISI_MCDMA_IRQ_TX");
+            if (rc)
+            {
+                printk(KERN_INFO "[ISI] unable to request IRQ for TX\n");
                 return rc;
             }
         }
-        counter +=1;
+        else {
+            rc = Init_ISI_IRQ(child,& isi_device_context->Rx_Channels[0], "ISI_MCDMA_IRQ_RX");
+            if (rc){
+                printk(KERN_INFO "[ISI] unable to request IRQ for RX\n");
+                return rc;
+            }
+        }
     }
 
     printk(KERN_INFO "ISI MCDMA module initialized\n");
     return 0;
 }
 
+
 /* Exit the mcdma device driver module.
  */
 static int ISI_p_MCDMA_remove(struct platform_device *pdev)
 {
-    if (irq > 0)
-        free_irq(irq, &Rx_Channels[0]);
+    if (isi_device_context->Tx_Channels[0]._IRQ > 0)
+        free_irq(isi_device_context->Tx_Channels[0]._IRQ, &isi_device_context->Tx_Channels[0]);
+    if (isi_device_context->Rx_Channels[0]._IRQ > 0)
+        free_irq(isi_device_context->Rx_Channels[0]._IRQ, &isi_device_context->Rx_Channels[0]);
 
     return 0;
 }
