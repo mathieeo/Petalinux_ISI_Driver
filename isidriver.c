@@ -24,11 +24,15 @@ MODULE_LICENSE("GPL");
 #define DMA_MAPPING (1 << 7)
 
 /* Innovative Magic Number */
-#define II_IOCTL_MAGIC_NUM  'm'
+#define ISI_IOCTL_MAGIC_NUM  'm'
 
-#define  IOCTL_ALLOC_DMA_MEMORY    _IOWR(II_IOCTL_MAGIC_NUM, 10,dma_memory_handle_t*)
-#define  IOCTL_FREE_DMA_MEMORY     _IOR (II_IOCTL_MAGIC_NUM, 11,dma_memory_handle_t*)
-#define  IOCTL_START_DMA           _IO  (II_IOCTL_MAGIC_NUM, 12)
+#define ISI_IOCTL_ALLOC_DMA_MEMORY    _IOWR(ISI_IOCTL_MAGIC_NUM, 10,dma_memory_handle_t*)
+#define ISI_IOCTL_FREE_DMA_MEMORY     _IOR (ISI_IOCTL_MAGIC_NUM, 11,dma_memory_handle_t*)
+#define ISI_IOCTL_START_DMA           _IO  (ISI_IOCTL_MAGIC_NUM, 12)
+#define ISI_IOCTL_WAIT_INTERRUPT      _IO  (ISI_IOCTL_MAGIC_NUM, 13)
+#define ISI_IOCTL_INTERRUPT_KICK      _IO  (ISI_IOCTL_MAGIC_NUM, 14)
+
+
 
 //static DECLARE_WAIT_QUEUE_HEAD(thread_wait);
 
@@ -38,13 +42,7 @@ static LIST_HEAD(MCDMA_channels);
 
 #define DRIVER_NAME 		       "ISI_MCDMA"
 #define NUMBER_OF_CHANNELS_PER_DIR     16
-#define CHANNEL_COUNT                  NUMBER_OF_CHANNELS_PER_DIR * 2      // RX 16 AND TX 16
-#define TX_CHANNEL		       0
-#define RX_CHANNEL		       1
 #define ERROR 			       -1
-#define NOT_LAST_CHANNEL 	       0
-#define LAST_CHANNEL 		       1
-#define NUMBER_OF_CHANNELS             16
 
 #define XILINX_BD_CNT	11
 #define MAX_DMA_HANDLES XILINX_BD_CNT
@@ -59,6 +57,10 @@ typedef struct
     unsigned        mapped;
     dma_addr_t      handle;
 } dma_memory_handle_t;
+
+// Wait Queue
+wait_queue_head_t _wait_queue;
+int IRQ_Kick_Flag;
 
 
 /* The following data structure represents a single channel of DMA, transmit or receive in the case
@@ -77,6 +79,7 @@ struct ISI_MCDMA_channel {
     enum dma_ctrl_flags flags;
     struct scatterlist sglist[XILINX_BD_CNT];
     dma_memory_handle_t dmas[XILINX_BD_CNT];
+    wait_queue_head_t *WaitQueue;
     int _IRQ;
     int _ID;
     u32 direction;					/* DMA_MEM_TO_DEV or DMA_DEV_TO_MEM */
@@ -142,7 +145,7 @@ static int MCDMA_Start_Channel_Transfer(struct ISI_MCDMA_channel *pchannel_p)
     if (!pchannel_p->desc) {
         for (i = 0; i < bd_cnt; i++)
             pr_warn("[ISI]: prep error with _off=0x%x ",
-                     test_buf_size);
+                    test_buf_size);
         msleep(100);
     }
     init_completion(&pchannel_p->cmp);
@@ -280,6 +283,19 @@ static ssize_t ISI_c_write (struct file *pfile, const char __user *buffer, size_
     return length;
 }
 
+static int isi_wait_interrupt_ioctl(struct file *pfile, void __user *uaddr)
+{
+    struct ISI_MCDMA_channel *pchannel_p = (struct ISI_MCDMA_channel *)pfile->private_data;
+
+
+    IRQ_Kick_Flag = 0;
+    wait_event_interruptible(*pchannel_p->WaitQueue, IRQ_Kick_Flag==1);
+        // if (signal_pending(current))
+        //         return -ERESTARTSYS;
+
+        return 0;
+}
+
 /* Perform I/O control to start a DMA transfer.
  */
 static long ISI_c_ioctl(struct file *pfile, unsigned int cmd , unsigned long arg)
@@ -289,13 +305,13 @@ static long ISI_c_ioctl(struct file *pfile, unsigned int cmd , unsigned long arg
     struct ISI_MCDMA_channel *pchannel_p = (struct ISI_MCDMA_channel *)pfile->private_data;
 
     switch (cmd) {
-    case IOCTL_ALLOC_DMA_MEMORY: {
+    case ISI_IOCTL_ALLOC_DMA_MEMORY: {
         return isi_allocate_dma_memory_ioctl(pfile, (void __user *)arg);
     }
-    case IOCTL_FREE_DMA_MEMORY: {
+    case ISI_IOCTL_FREE_DMA_MEMORY: {
         return isi_free_dma_memory_ioctl(pfile, (void __user *)arg);
     }
-    case IOCTL_START_DMA: {
+    case ISI_IOCTL_START_DMA: {
 
         err = MCDMA_Start_Channel_Transfer(pchannel_p);
         if (err) {
@@ -303,6 +319,14 @@ static long ISI_c_ioctl(struct file *pfile, unsigned int cmd , unsigned long arg
             return err;
         }
         return 1;
+    }
+    case ISI_IOCTL_WAIT_INTERRUPT: {
+        return isi_wait_interrupt_ioctl(pfile, (void __user *)arg);
+    }
+    case ISI_IOCTL_INTERRUPT_KICK: {
+      IRQ_Kick_Flag = 1;
+      wake_up_interruptible(pchannel_p->WaitQueue);
+      break;
     }
     default: {
         printk(KERN_INFO "[ISI] : deafult \n");
@@ -448,6 +472,7 @@ static int create_channel(struct platform_device *pdev, struct ISI_MCDMA_channel
 
     pchannel_p->dma_device_p = &pdev->dev;
     pchannel_p->_ID = channel_id;
+    pchannel_p->WaitQueue = &_wait_queue;
 
     /* Initialize the character device for the dma proxy channel
          */
@@ -486,18 +511,22 @@ static irqreturn_t irq_handler(int irq, void *data)
         pr_warn("______DMA NOT COMPLETE_____");
     }
     else
+      {
         pr_warn("______DMA COMPLETED_____");
+        IRQ_Kick_Flag = 1;
+        wake_up_interruptible(channel->WaitQueue);
+      }
 
     return IRQ_HANDLED;
 }
 
 /*
  */
-static int Init_ISI_IRQ(struct device_node *child, struct ISI_MCDMA_channel *channel, const char *  irq_name)
+static int Init_ISI_IRQ(struct device_node *child, struct ISI_MCDMA_channel *channel, char * irq_name)
 {
     int rc;
 
-    channel->_IRQ = irq_of_parse_and_map(child, 0);
+    channel->_IRQ = irq_of_parse_and_map(child, channel->_ID);
 
     printk(KERN_INFO "irq[%d] init with channel[%d]\n", channel->_IRQ, channel->_ID);
 
@@ -519,46 +548,64 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
 
     isi_device_context = kzalloc(sizeof(struct ISI_Device_Context), GFP_KERNEL);
 
-    for(i=0;i<NUMBER_OF_CHANNELS_PER_DIR;i++){
-        char tx_device_name[32] = "mcdma_tx_";
-        char dummy[32] = "";
-        char * name;
-        sprintf(dummy, "%d", i);
-        name = strcat(tx_device_name, dummy);
-        pr_warn("[Creating Tx Channel [%d] With Name [%s]", i, name);
-        rc = create_channel(pdev, &isi_device_context->Tx_Channels[i], i, name, DMA_MEM_TO_DEV);
-        if (rc)
-            return rc;
-    }
-
-
-    for(i=0;i<NUMBER_OF_CHANNELS_PER_DIR;i++){
-        char rx_device_name[32] = "mcdma_rx_";
-        char dummy[32] = "";
-        char * name;
-        sprintf(dummy, "%d", i);
-        name = strcat(rx_device_name, dummy);
-        pr_warn("[Creating Rx Channel [%d] With Name [%s]", i, name);
-        rc = create_channel(pdev, &isi_device_context->Rx_Channels[i], i, name, DMA_DEV_TO_MEM);
-        if (rc)
-            return rc;
-    }
+    //Init the IRQ wait queue
+    init_waitqueue_head(&_wait_queue);
 
     /* Initialize the channels */
     for_each_child_of_node(pdev->dev.of_node, child) {
         if(of_device_is_compatible(child, "xlnx,axi-dma-mm2s-channel")){
-            rc = Init_ISI_IRQ(child, &isi_device_context->Tx_Channels[0], "ISI_MCDMA_IRQ_TX");
-            if (rc)
-            {
-                printk(KERN_INFO "[ISI] unable to request IRQ for TX\n");
-                return rc;
+            for(i=0;i<NUMBER_OF_CHANNELS_PER_DIR;i++){
+                char tx_cdevice_name[32] = "mcdma_tx_";
+                char tx_irqdevice_name[32] = "MCDMA_IRQ_TX_";
+                char dummy[32] = "";
+                char * name1;
+                char * name2;
+                sprintf(dummy, "%d", i);
+                name1 = strcat(tx_cdevice_name, dummy);
+                pr_warn("[Creating Tx Channel [%d] With Name [%s]", i, name1);
+                rc = create_channel(pdev, &isi_device_context->Tx_Channels[i], i, name1, DMA_MEM_TO_DEV);
+                if (rc)
+                {
+                    printk(KERN_INFO "[ISI] unable to create char device for TX[%d]\n", i);
+                    return rc;
+                }
+              // Only IRQ for channel zero will be handled because the other channels are linked with this irq
+              if(i==0) {
+                name2 = strcat(tx_irqdevice_name, dummy);
+                rc = Init_ISI_IRQ(child, &isi_device_context->Tx_Channels[i], name2);
+                if (rc)
+                {
+                    printk(KERN_INFO "[ISI] unable to request IRQ for TX[%d]\n", i);
+                    return rc;
+                }
+              }
             }
         }
         else {
-            rc = Init_ISI_IRQ(child,& isi_device_context->Rx_Channels[0], "ISI_MCDMA_IRQ_RX");
-            if (rc){
-                printk(KERN_INFO "[ISI] unable to request IRQ for RX\n");
-                return rc;
+            for(i=0;i<NUMBER_OF_CHANNELS_PER_DIR;i++){
+                char rx_cdevice_name[32] = "mcdma_rx_";
+                char rx_irqdevice_name[32] = "MCDMA_IRQ_RX_";
+                char dummy[32] = "";
+                char * name1;
+                char * name2;
+                sprintf(dummy, "%d", i);
+                name1 = strcat(rx_cdevice_name, dummy);
+                pr_warn("[Creating Rx Channel [%d] With Name [%s]", i, name1);
+                rc = create_channel(pdev, &isi_device_context->Rx_Channels[i], i, name1, DMA_DEV_TO_MEM);
+                if (rc)
+                {
+                    printk(KERN_INFO "[ISI] unable to create char device for RX[%d]\n", i);
+                    return rc;
+                }
+                // Only IRQ for channel zero will be handled because the other channels are linked with this irq
+                if(i==0) {
+                name2 = strcat(rx_irqdevice_name, dummy);
+                rc = Init_ISI_IRQ(child,& isi_device_context->Rx_Channels[i], name2);
+                if (rc){
+                    printk(KERN_INFO "[ISI] unable to request IRQ for RX\n");
+                    return rc;
+                }
+              }
             }
         }
     }
@@ -572,10 +619,14 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
  */
 static int ISI_p_MCDMA_remove(struct platform_device *pdev)
 {
-    if (isi_device_context->Tx_Channels[0]._IRQ > 0)
-        free_irq(isi_device_context->Tx_Channels[0]._IRQ, &isi_device_context->Tx_Channels[0]);
-    if (isi_device_context->Rx_Channels[0]._IRQ > 0)
-        free_irq(isi_device_context->Rx_Channels[0]._IRQ, &isi_device_context->Rx_Channels[0]);
+    int i;
+
+    for(i=0;i<NUMBER_OF_CHANNELS_PER_DIR;i++){
+        if (isi_device_context->Tx_Channels[i]._IRQ > 0)
+            free_irq(isi_device_context->Tx_Channels[i]._IRQ, &isi_device_context->Tx_Channels[i]);
+        if (isi_device_context->Rx_Channels[i]._IRQ > 0)
+            free_irq(isi_device_context->Rx_Channels[i]._IRQ, &isi_device_context->Rx_Channels[i]);
+    }
 
     return 0;
 }
