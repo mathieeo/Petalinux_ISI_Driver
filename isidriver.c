@@ -28,9 +28,10 @@ MODULE_LICENSE("GPL");
 
 #define ISI_IOCTL_ALLOC_DMA_MEMORY    _IOWR(ISI_IOCTL_MAGIC_NUM, 10,dma_memory_handle_t*)
 #define ISI_IOCTL_FREE_DMA_MEMORY     _IOR (ISI_IOCTL_MAGIC_NUM, 11,dma_memory_handle_t*)
-#define ISI_IOCTL_START_DMA           _IO  (ISI_IOCTL_MAGIC_NUM, 12)
-#define ISI_IOCTL_WAIT_INTERRUPT      _IO  (ISI_IOCTL_MAGIC_NUM, 13)
-#define ISI_IOCTL_INTERRUPT_KICK      _IO  (ISI_IOCTL_MAGIC_NUM, 14)
+#define ISI_IOCTL_CONFIG_START_DMA    _IO  (ISI_IOCTL_MAGIC_NUM, 12)
+#define ISI_IOCTL_RESTART_DMA         _IO  (ISI_IOCTL_MAGIC_NUM, 13)
+#define ISI_IOCTL_WAIT_INTERRUPT      _IO  (ISI_IOCTL_MAGIC_NUM, 14)
+#define ISI_IOCTL_INTERRUPT_KICK      _IO  (ISI_IOCTL_MAGIC_NUM, 15)
 
 
 
@@ -41,7 +42,7 @@ static unsigned int test_buf_size = 8192;
 static LIST_HEAD(MCDMA_channels);
 
 #define DRIVER_NAME 		       "ISI_MCDMA"
-#define NUMBER_OF_CHANNELS_PER_DIR     16
+#define NUMBER_OF_CHANNELS_PER_DIR     8
 #define ERROR 			       -1
 
 #define XILINX_BD_CNT	11
@@ -58,9 +59,6 @@ typedef struct
     dma_addr_t      handle;
 } dma_memory_handle_t;
 
-// Wait Queue
-wait_queue_head_t _wait_queue;
-int IRQ_Kick_Flag;
 
 
 /* The following data structure represents a single channel of DMA, transmit or receive in the case
@@ -81,11 +79,17 @@ struct ISI_MCDMA_channel {
     dma_memory_handle_t dmas[XILINX_BD_CNT];
     wait_queue_head_t *WaitQueue;
     int _IRQ;
+    int *_IRQ_Flag;
     int _ID;
     u32 direction;					/* DMA_MEM_TO_DEV or DMA_DEV_TO_MEM */
 };
 
 struct ISI_Device_Context {
+
+  // Wait Queue
+  wait_queue_head_t _wait_queue;
+  int IRQ_Kick_Flag;
+
     /* Allocate the channels for this example statically rather than dynamically for simplicity.
  */
     struct ISI_MCDMA_channel Rx_Channels[NUMBER_OF_CHANNELS_PER_DIR];
@@ -95,18 +99,14 @@ struct ISI_Device_Context {
 struct ISI_Device_Context *isi_device_context;
 
 
-
-
-
-
 static void MCDMA_slave_callback(void *completion)
 {
     complete(completion);
 
-    pr_warn("DMA Callback....");
+  // DEBUGONLY   pr_warn("DMA Callback....");
 }
 
-static int MCDMA_Start_Channel_Transfer(struct ISI_MCDMA_channel *pchannel_p)
+static int MCDMA_Configure_Start_Channel_Transfer(struct ISI_MCDMA_channel *pchannel_p)
 {
     struct dma_chan *chan;
     int ret;
@@ -160,10 +160,24 @@ static int MCDMA_Start_Channel_Transfer(struct ISI_MCDMA_channel *pchannel_p)
     }
     dma_async_issue_pending(chan);
 
-    pr_warn("[ISI]: DMA issued for channel[%d] ",
-            pchannel_p->_ID);
+  // debugonly  pr_warn("[ISI]: DMA issued for channel[%d] ",  pchannel_p->_ID);
 
     return 0;
+}
+
+static int MCDMA_Restart_Channel_Transfer(struct ISI_MCDMA_channel *pchannel_p)
+{
+  // DEBUGONLY  pr_warn("[ISI]: Restarting DMA Transfer channel : %d ", pchannel_p->_ID);
+  if (dma_submit_error(pchannel_p->_cookie)) {
+      pr_warn("[ISI]: submit error %d with _off=0x%x ",
+              pchannel_p->_cookie,  test_buf_size);
+      msleep(100);
+  }
+  dma_async_issue_pending(pchannel_p->channel_p);
+
+// debugonly  pr_warn("[ISI]: DMA issued for channel[%d] ",  pchannel_p->_ID);
+
+  return 0;
 }
 
 /**
@@ -193,6 +207,7 @@ static int isi_allocate_dma_memory_ioctl(struct file *pfile, void __user *uaddr)
     struct ISI_MCDMA_channel *pchannel_p = (struct ISI_MCDMA_channel *)pfile->private_data;
     dma_memory_handle_t  minfo;
     int idx = -1;
+
 
     if ((idx = find_dma_handle(pchannel_p, NULL)) == -1) {
         printk(KERN_INFO "[ISI] : cannot find a free dma slot.\n");
@@ -228,6 +243,7 @@ static int isi_allocate_dma_memory_ioctl(struct file *pfile, void __user *uaddr)
         printk(KERN_INFO "[ISI] : CANNOT COPY TO THE USER POINTER. \n");
         return -EFAULT;
     }
+
 
     return 0;
 }
@@ -287,9 +303,10 @@ static int isi_wait_interrupt_ioctl(struct file *pfile, void __user *uaddr)
 {
     struct ISI_MCDMA_channel *pchannel_p = (struct ISI_MCDMA_channel *)pfile->private_data;
 
+    //DEBUGONLY printk(KERN_INFO "[isi_wait_interrupt_ioctl] : Channel ID %d \n", pchannel_p->_ID);
 
-    IRQ_Kick_Flag = 0;
-    wait_event_interruptible(*pchannel_p->WaitQueue, IRQ_Kick_Flag==1);
+    *pchannel_p->_IRQ_Flag = 0;
+    wait_event_interruptible(*pchannel_p->WaitQueue, (*pchannel_p->_IRQ_Flag)==1);
         // if (signal_pending(current))
         //         return -ERESTARTSYS;
 
@@ -311,11 +328,20 @@ static long ISI_c_ioctl(struct file *pfile, unsigned int cmd , unsigned long arg
     case ISI_IOCTL_FREE_DMA_MEMORY: {
         return isi_free_dma_memory_ioctl(pfile, (void __user *)arg);
     }
-    case ISI_IOCTL_START_DMA: {
+    case ISI_IOCTL_CONFIG_START_DMA: {
 
-        err = MCDMA_Start_Channel_Transfer(pchannel_p);
+        err = MCDMA_Configure_Start_Channel_Transfer(pchannel_p);
         if (err) {
-            pr_err("ISI_MCDMA: Unable to start channel\n");
+            pr_err("ISI_MCDMA: Unable to configure and start channel\n");
+            return err;
+        }
+        return 1;
+    }
+    case ISI_IOCTL_RESTART_DMA: {
+
+        err = MCDMA_Restart_Channel_Transfer(pchannel_p);
+        if (err) {
+            pr_err("ISI_MCDMA: Unable to restart channel transfer\n");
             return err;
         }
         return 1;
@@ -324,9 +350,11 @@ static long ISI_c_ioctl(struct file *pfile, unsigned int cmd , unsigned long arg
         return isi_wait_interrupt_ioctl(pfile, (void __user *)arg);
     }
     case ISI_IOCTL_INTERRUPT_KICK: {
-      IRQ_Kick_Flag = 1;
+    *pchannel_p->_IRQ_Flag = 1;
+    //DEBUGONLY printk(KERN_INFO "[ISI_IOCTL_INTERRUPT_KICK] : Channel ID %d \n", pchannel_p->_ID);
       wake_up_interruptible(pchannel_p->WaitQueue);
       break;
+
     }
     default: {
         printk(KERN_INFO "[ISI] : deafult \n");
@@ -360,7 +388,8 @@ static int ISI_c_close(struct inode *pinode, struct file *pfile)
     struct ISI_MCDMA_channel *pchannel_p = (struct ISI_MCDMA_channel *)pfile->private_data;
     struct dma_device *dma_device = pchannel_p->channel_p->device;
 
-    /* Stop all the activity when the channel is closed assuming this
+    /* Stop all the activity when the
+      channel is closed assuming this
              * may help if the application is aborted without normal closure
              */
 
@@ -371,6 +400,7 @@ static int ISI_c_close(struct inode *pinode, struct file *pfile)
 struct file_operations ISI_c_file_operations = {
     .owner          = THIS_MODULE,
     .open           = ISI_c_open,
+
     .read           = ISI_c_read,
     .write          = ISI_c_write,
     .unlocked_ioctl = ISI_c_ioctl,
@@ -472,7 +502,8 @@ static int create_channel(struct platform_device *pdev, struct ISI_MCDMA_channel
 
     pchannel_p->dma_device_p = &pdev->dev;
     pchannel_p->_ID = channel_id;
-    pchannel_p->WaitQueue = &_wait_queue;
+    pchannel_p->WaitQueue = &isi_device_context->_wait_queue;
+    pchannel_p->_IRQ_Flag = &isi_device_context->IRQ_Kick_Flag;
 
     /* Initialize the character device for the dma proxy channel
          */
@@ -502,9 +533,9 @@ static irqreturn_t irq_handler(int irq, void *data)
     struct ISI_MCDMA_channel *channel = (struct ISI_MCDMA_channel *)data;
     enum dma_status status;
 
-    pr_warn("______________________INTERRUPT[%d]______________________", irq);
-    printk(KERN_INFO "irq[%d] with channel[%d]\n", channel->_IRQ, channel->_ID);
-
+  // debugonly  pr_warn("______________________INTERRUPT[%d]______________________", irq);
+    // DEBUGONLY    printk(KERN_INFO "irq[%d] with channel[%d]\n", channel->_IRQ, channel->_ID);
+if(channel->_ID==0){
     status = dma_async_is_tx_complete(channel->channel_p, channel->_cookie, NULL, NULL);
 
     if (status != DMA_COMPLETE) {
@@ -512,11 +543,11 @@ static irqreturn_t irq_handler(int irq, void *data)
     }
     else
       {
-        pr_warn("______DMA COMPLETED_____");
-        IRQ_Kick_Flag = 1;
+      // debugonly  pr_warn("______DMA COMPLETED_____");
+        *channel->_IRQ_Flag = 1;
         wake_up_interruptible(channel->WaitQueue);
       }
-
+}
     return IRQ_HANDLED;
 }
 
@@ -528,7 +559,7 @@ static int Init_ISI_IRQ(struct device_node *child, struct ISI_MCDMA_channel *cha
 
     channel->_IRQ = irq_of_parse_and_map(child, channel->_ID);
 
-    printk(KERN_INFO "irq[%d] init with channel[%d]\n", channel->_IRQ, channel->_ID);
+  //DEBUGONLY  printk(KERN_INFO "irq[%d] init with channel[%d]\n", channel->_IRQ, channel->_ID);
 
     rc = request_irq(channel->_IRQ, irq_handler,
                      IRQF_SHARED, irq_name, channel);
@@ -549,7 +580,8 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
     isi_device_context = kzalloc(sizeof(struct ISI_Device_Context), GFP_KERNEL);
 
     //Init the IRQ wait queue
-    init_waitqueue_head(&_wait_queue);
+    init_waitqueue_head(&isi_device_context->_wait_queue);
+    isi_device_context->IRQ_Kick_Flag = 0;
 
     /* Initialize the channels */
     for_each_child_of_node(pdev->dev.of_node, child) {
@@ -570,7 +602,7 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
                     return rc;
                 }
               // Only IRQ for channel zero will be handled because the other channels are linked with this irq
-              if(i==0) {
+            //  if(i==0) {
                 name2 = strcat(tx_irqdevice_name, dummy);
                 rc = Init_ISI_IRQ(child, &isi_device_context->Tx_Channels[i], name2);
                 if (rc)
@@ -578,7 +610,7 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
                     printk(KERN_INFO "[ISI] unable to request IRQ for TX[%d]\n", i);
                     return rc;
                 }
-              }
+          //    }
             }
         }
         else {
@@ -598,14 +630,14 @@ static int ISI_p_MCDMA_probe(struct platform_device *pdev)
                     return rc;
                 }
                 // Only IRQ for channel zero will be handled because the other channels are linked with this irq
-                if(i==0) {
+              //  if(i==0) {
                 name2 = strcat(rx_irqdevice_name, dummy);
                 rc = Init_ISI_IRQ(child,& isi_device_context->Rx_Channels[i], name2);
                 if (rc){
                     printk(KERN_INFO "[ISI] unable to request IRQ for RX\n");
                     return rc;
                 }
-              }
+            //  }
             }
         }
     }
