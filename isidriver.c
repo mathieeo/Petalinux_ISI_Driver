@@ -32,9 +32,7 @@ MODULE_LICENSE("GPL");
 #define ISI_IOCTL_WAIT_INTERRUPT _IO(ISI_IOCTL_MAGIC_NUM, 14)
 #define ISI_IOCTL_INTERRUPT_KICK _IO(ISI_IOCTL_MAGIC_NUM, 15)
 
-//static DECLARE_WAIT_QUEUE_HEAD(thread_wait);
-
-static unsigned int test_buf_size = 8192;
+//static DECLARE_WAIT_QUEUE_HEAD(thread_wait); 
 
 static LIST_HEAD(MCDMA_channels);
 
@@ -42,7 +40,7 @@ static LIST_HEAD(MCDMA_channels);
 #define NUMBER_OF_CHANNELS_PER_DIR 8
 #define ERROR -1
 
-#define XILINX_BD_CNT 11
+#define XILINX_BD_CNT 2
 #define MAX_DMA_HANDLES XILINX_BD_CNT
 
 typedef struct
@@ -73,6 +71,7 @@ struct ISI_MCDMA_channel
     enum dma_ctrl_flags flags;
     struct scatterlist sglist[XILINX_BD_CNT];
     dma_memory_handle_t dmas[XILINX_BD_CNT];
+    unsigned int Buffers_Size;
     wait_queue_head_t *WaitQueue;
     int _IRQ;
     int *_IRQ_Flag;
@@ -82,7 +81,6 @@ struct ISI_MCDMA_channel
 
 struct ISI_Device_Context
 {
-
     // Wait QueuemSignaled
     wait_queue_head_t _rx_wait_queue;
     int _Rx_IRQ_Kick_Flag;
@@ -101,7 +99,7 @@ static void MCDMA_slave_callback(void *completion)
 {
     complete(completion);
 
-    pr_warn("DMA Callback....\n");
+   // DEBUGONLY pr_warn("DMA Callback....\n");
 }
 
 static int MCDMA_Configure_Start_Channel_Transfer(struct ISI_MCDMA_channel *pchannel_p)
@@ -113,7 +111,7 @@ static int MCDMA_Configure_Start_Channel_Transfer(struct ISI_MCDMA_channel *pcha
     u8 align = 0;
     struct dma_device *dma_dev;
 
-    //  pr_warn("[ISI]: starting DMA Transfer channel : %d ", pchannel_p->_ID);
+     // DEBUGONLY pr_warn("[ISI]: starting DMA Transfer channel : %d ", pchannel_p->_ID);
 
     ret = -ENOMEM;
     /* Ensure that all previous reads are complete */
@@ -127,10 +125,10 @@ static int MCDMA_Configure_Start_Channel_Transfer(struct ISI_MCDMA_channel *pcha
     if (dma_dev->copy_align > align)
         align = dma_dev->copy_align;
 
-    if (1 << align > test_buf_size)
+    if (1 << align > pchannel_p->Buffers_Size)
     {
         pr_err("%u-byte buffer too small for %d-byte alignmen_pchannel_pt\n",
-               test_buf_size, 1 << align);
+               pchannel_p->Buffers_Size, 1 << align);
         return ERROR;
     }
 
@@ -139,7 +137,7 @@ static int MCDMA_Configure_Start_Channel_Transfer(struct ISI_MCDMA_channel *pcha
     for (i = 0; i < bd_cnt; i++)
     {
         sg_dma_address(&pchannel_p->sglist[i]) = pchannel_p->dmas[i].handle;
-        sg_dma_len(&pchannel_p->sglist[i]) = test_buf_size;
+        sg_dma_len(&pchannel_p->sglist[i]) = pchannel_p->Buffers_Size;
     }
 
     pchannel_p->desc = dma_dev->device_prep_slave_sg(chan, pchannel_p->sglist, bd_cnt, pchannel_p->direction, pchannel_p->flags, NULL);
@@ -148,8 +146,9 @@ static int MCDMA_Configure_Start_Channel_Transfer(struct ISI_MCDMA_channel *pcha
     {
         for (i = 0; i < bd_cnt; i++)
             pr_warn("[ISI]: prep error with _off=0x%x ",
-                    test_buf_size);
+                    pchannel_p->Buffers_Size);
         msleep(100);
+        return ERROR;
     }
 
     init_completion(&pchannel_p->cmp);
@@ -160,13 +159,13 @@ static int MCDMA_Configure_Start_Channel_Transfer(struct ISI_MCDMA_channel *pcha
     if (dma_submit_error(pchannel_p->_cookie))
     {
         pr_warn("[ISI]: submit error %d with _off=0x%x ",
-                pchannel_p->_cookie, test_buf_size);
+                pchannel_p->_cookie, pchannel_p->Buffers_Size);
         msleep(100);
     }
 
     dma_async_issue_pending(chan);
 
-    //  pr_warn("[ISI]: DMA issued for channel[%d] ",  pchannel_p->_ID);
+   // DEBUGONLY   pr_warn("[ISI]: DMA issued for channel[%d] ",  pchannel_p->_ID);
 
     return 0;
 }
@@ -177,7 +176,7 @@ static int MCDMA_Restart_Channel_Transfer(struct ISI_MCDMA_channel *pchannel_p)
     if (dma_submit_error(pchannel_p->_cookie))
     {
         pr_warn("[ISI]: submit error %d with _off=0x%x ",
-                pchannel_p->_cookie, test_buf_size);
+                pchannel_p->_cookie, pchannel_p->Buffers_Size);
         msleep(100);
     }
     dma_async_issue_pending(pchannel_p->channel_p);
@@ -227,7 +226,8 @@ static int isi_allocate_dma_memory_ioctl(struct file *pfile, void __user *uaddr)
         return -EACCES;
     }
 
-    pchannel_p->dmas[idx].size = minfo.size;
+     
+    pchannel_p->Buffers_Size = pchannel_p->dmas[idx].size = minfo.size;
     pchannel_p->dmas[idx].kaddr = minfo.kaddr = dma_alloc_coherent(pchannel_p->dma_device_p,
                                                                    pchannel_p->dmas[idx].size,
                                                                    &pchannel_p->dmas[idx].handle,
@@ -319,10 +319,10 @@ static int isi_wait_interrupt_ioctl(struct file *pfile, void __user *uaddr)
 
     *pchannel_p->_IRQ_Flag = 0;
 
-       // printk(KERN_INFO "_____[isi_wait_interrupt_ioctl] : Channel ID %d IRQ_Flag_Addr %p Value %d \n", pchannel_p->_ID, pchannel_p->_IRQ_Flag, *pchannel_p->_IRQ_Flag);
+       // DEBUGONLY  printk(KERN_INFO "_____[isi_wait_interrupt_ioctl] : Channel ID %d IRQ_Flag_Addr %p Value %d \n", pchannel_p->_ID, pchannel_p->_IRQ_Flag, *pchannel_p->_IRQ_Flag);
 
     wait_event_interruptible(*pchannel_p->WaitQueue, (*pchannel_p->_IRQ_Flag) == 1);
-      //  printk(KERN_INFO "_____[isi_wait_interrupt_ioctl]_ AFTER wait_event_interruptible");
+      // DEBUGONLY   printk(KERN_INFO "_____[isi_wait_interrupt_ioctl]_ AFTER wait_event_interruptible");
     // if (signal_pending(current))
     //         return -ERESTARTSYS;
 
@@ -341,7 +341,14 @@ static long ISI_c_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 
     switch (cmd)
     {
-    case ISI_IOCTL_ALLOC_DMA_MEMORY:cd /mnt && chmod +x Test_Software.elf && ./Test_Software.elf
+    case ISI_IOCTL_ALLOC_DMA_MEMORY:
+    {
+        return isi_allocate_dma_memory_ioctl(pfile, (void __user *)arg);
+    }
+    case ISI_IOCTL_FREE_DMA_MEMORY:
+    {
+        return isi_free_dma_memory_ioctl(pfile, (void __user *)arg);
+    }
     case ISI_IOCTL_CONFIG_START_DMA:
     {
         err = MCDMA_Configure_Start_Channel_Transfer(pchannel_p);
@@ -583,7 +590,7 @@ static irqreturn_t irq_handler(int irq, void *data)
         }
         else
         {
-          // printk(KERN_INFO "[___INTERRUPT] : IRQ_Flag_Addr %p Value %d \n", channel->_IRQ_Flag, *channel->_IRQ_Flag);
+         //  printk(KERN_INFO "[___INTERRUPT] : IRQ_Flag_Addr %p Value %d \n", channel->_IRQ_Flag, *channel->_IRQ_Flag);
             *channel->_IRQ_Flag = 1;
             wake_up_interruptible(channel->WaitQueue);
         }
@@ -726,7 +733,7 @@ static int ISI_p_MCDMA_remove(struct platform_device *pdev)
  */
 static const struct of_device_id ISI_MCDMA_of_ids[] = {
     {
-        .compatible = "xlnx,isi_mcdma",
+        .compatible = "isi,isi_mcdma",
     },
     {}};
 
